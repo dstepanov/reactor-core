@@ -17,6 +17,7 @@
 package reactor.core.publisher;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -37,6 +38,7 @@ import java.util.function.Function;
 
 import io.micrometer.context.ContextRegistry;
 import io.micrometer.context.ContextSnapshotFactory;
+import io.micrometer.context.ThreadLocalAccessor;
 import org.assertj.core.api.SoftAssertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -76,9 +78,11 @@ class ContextPropagationTest {
 
 	private static final String KEY1 = "ContextPropagationTest.key1";
 	private static final String KEY2 = "ContextPropagationTest.key2";
+	private static final String KEY3 = "ContextPropagationTest.key3";
 
 	private static final ThreadLocal<String> REF1 = ThreadLocal.withInitial(() -> "ref1_init");
 	private static final ThreadLocal<String> REF2 = ThreadLocal.withInitial(() -> "ref2_init");
+	private static final ThreadLocal<String> REF3 = new ThreadLocal<>();
 
 	@BeforeAll
 	static void initializeThreadLocalAccessors() {
@@ -846,6 +850,73 @@ class ContextPropagationTest {
 				);
 		}
 
+	}
+
+	@Test
+	void validateContextWrite() {
+		ContextRegistry globalRegistry = ContextRegistry.getInstance();
+		globalRegistry.registerThreadLocalAccessor(new RestorePreviousValueThreadLocalAccessor());
+		Hooks.enableAutomaticContextPropagation();
+
+		AtomicReference<String> value = new AtomicReference<>();
+		Mono.fromCallable(() -> {
+					value.set(REF3.get());
+					return "somethingToReturn";
+				})
+				.flatMapMany(Flux::just)
+				.subscribeOn(Schedulers.boundedElastic())
+				.contextWrite(Context.empty()) // Remove me
+				.contextWrite(Context.of(KEY3, "present"))
+				.blockLast();
+
+		assertThat(value.get()).isEqualTo("present");
+	}
+
+	private static class RestorePreviousValueThreadLocalAccessor implements ThreadLocalAccessor<String> {
+
+		private final ThreadLocal<ArrayDeque<Runnable>> localScopes = new ThreadLocal<>();
+
+		@Override
+		public String key() {
+			return KEY3;
+		}
+
+		@Override
+		public String getValue() {
+			return REF3.get();
+		}
+
+		@Override
+		public void setValue(String value) {
+			ArrayDeque<Runnable> scopes = localScopes.get();
+			if (scopes == null) {
+				scopes = new ArrayDeque<>(5);
+				localScopes.set(scopes);
+			}
+			String previousValue = REF3.get();
+			REF3.set(value);
+			scopes.push(() -> REF3.set(previousValue));
+		}
+
+		@Override
+		public void setValue() {
+			// Do nothing
+		}
+
+		@Override
+		public void restore(String previousValue) {
+			ArrayDeque<Runnable> scopes = localScopes.get();
+			if (scopes != null && !scopes.isEmpty()) {
+				scopes.pop().run(); // Restore previous scope
+				if (scopes.isEmpty()) {
+					localScopes.remove();
+				}
+			}
+		}
+
+		@Override
+		public void restore() {
+		}
 	}
 
 	@Nested
